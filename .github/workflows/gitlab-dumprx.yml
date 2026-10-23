@@ -34,11 +34,13 @@ jobs:
         cd dumprx && bash setup.sh
 
     - name: Dump Firmware
+      env:
+        FIRMWARE_LINK: ${{ github.event.inputs.FIRMWARE_LINK }}
       run: |
         cd workspace/dumprx
-        bash dumper.sh ${{ github.event.inputs.FIRMWARE_LINK }}
+        bash dumper.sh "$FIRMWARE_LINK"
         cd out
-        echo "MANUFACTURER_NAME=$(grep "ro.product.vendor.manufacturer" vendor/build.prop | awk -F "=" '{split($2, words, " "); print words[1]; exit}')" >> $GITHUB_ENV
+        echo "MANUFACTURER_NAME=$(grep "ro.product.vendor.manufacturer" vendor/build.prop | awk -F "=" '{split($2, words, " "); print words[1]; exit}')" >> "$GITHUB_ENV"
 
     - name: Set Variables - if oplus
       if: env.MANUFACTURER_NAME == 'oplus'
@@ -46,58 +48,107 @@ jobs:
         cd workspace/dumprx/out
         rm -rf .git
         if [ -d odm ]; then
-           echo "ODM directory exist..."
+           echo "ODM directory exists..."
         else
-           echo "Making fake ODM directory..."
-           mkdir -p odm && cd odm
-           echo "ro.vendor.oplus.market.name=ossi-${{ github.run_id }}" > build.prop
-           cd ..
+          mkdir -p odm
+          echo "ro.vendor.oplus.market.name=ossi-${{ github.run_id }}" > odm/build.prop
         fi
-        echo "VENDOR_NAME=$(grep "ro.vendor.oplus.market.name" odm/build.prop | awk -F "=" '{split($2, words, " "); print words[1]; exit}')" >> $GITHUB_ENV
-        echo "BRANCH=$(grep "ro.vendor.build.id" vendor/build.prop | awk -F "=" '{split($2, words, " "); print words[1]; exit}')" >> $GITHUB_ENV
+        echo "VENDOR_NAME=$(grep "ro.vendor.oplus.market.name" odm/build.prop | awk -F "=" '{split($2, words, " "); print words[1]; exit}')" >> "$GITHUB_ENV"
+        echo "BRANCH=$(grep "ro.vendor.build.id" vendor/build.prop | awk -F "=" '{split($2, words, " "); print words[1]; exit}')" >> "$GITHUB_ENV"
 
     - name: Set Variables - if others
       if: env.MANUFACTURER_NAME != 'oplus'
       run: |
         cd workspace/dumprx/out
         rm -rf .git
-        echo "VENDOR_NAME=$(grep "ro.product.vendor.device" vendor/build.prop | awk -F "=" '{split($2, words, " "); print words[1]; exit}')" >> $GITHUB_ENV
-        echo "BRANCH=$(grep "ro.vendor.build.id" vendor/build.prop | awk -F "=" '{split($2, words, " "); print words[1]; exit}')" >> $GITHUB_ENV
+        echo "VENDOR_NAME=$(grep "ro.product.vendor.device" vendor/build.prop | awk -F "=" '{split($2, words, " "); print words[1]; exit}')" >> "$GITHUB_ENV"
+        echo "BRANCH=$(grep "ro.vendor.build.id" vendor/build.prop | awk -F "=" '{split($2, words, " "); print words[1]; exit}')" >> "$GITHUB_ENV"
 
-    - name: Create Gitlab Repository
+    - name: Create or Reuse GitLab Repository
+      env:
+        GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
       run: |
-        cd workspace
-        curl --header "PRIVATE-TOKEN: ${{ secrets.GITLAB_TOKEN }}" -X POST "https://gitlab.com/api/v4/projects?name=android_dump_${{ env.MANUFACTURER_NAME }}_${{ env.VENDOR_NAME }}&visibility=public" > repo.json
-        echo "USERNAME=$(cat repo.json | grep -o '"username":"[^"]*' | cut -d'"' -f4)" >> $GITHUB_ENV
-        cat repo.json
+        REPO_NAME="android_dump_${MANUFACTURER_NAME}_${VENDOR_NAME}"
+        RESPONSE=$(curl -sS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" --request POST --data-urlencode "name=${REPO_NAME}" --data "visibility=public" "https://gitlab.com/api/v4/projects")
+        PROJECT_PATH=$(echo "$RESPONSE" | jq -r '.path_with_namespace // empty')
+        if [ -z "$PROJECT_PATH" ]; then
+          RESPONSE=$(curl -fsS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" --get --data-urlencode "search=${REPO_NAME}" --data "simple=true" "https://gitlab.com/api/v4/projects")
+          PROJECT_PATH=$(echo "$RESPONSE" | jq -r --arg name "$REPO_NAME" '[.[] | select(.path == $name)][0].path_with_namespace // empty')
+        fi
+        if [ -z "$PROJECT_PATH" ]; then
+          echo "ERROR: Could not create or find GitLab repository."
+          exit 1
+        fi
+        PROJECT_ID=$(curl -fsS --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "https://gitlab.com/api/v4/projects/$(printf '%s' "$PROJECT_PATH" | jq -sRr @uri)" | jq -r '.id // empty')
+        if [ -z "$PROJECT_ID" ]; then
+          echo "ERROR: Could not retrieve GitLab project ID."
+          exit 1
+        fi
+        echo "GITLAB_PROJECT_PATH=${PROJECT_PATH}" >> "$GITHUB_ENV"
+        echo "GITLAB_PROJECT_ID=${PROJECT_ID}" >> "$GITHUB_ENV"
+        echo "Using repository: ${PROJECT_PATH}"
 
-    - name: Push as Repository
+    - name: Push Firmware Dump
+      env:
+        GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        GITLAB_TOKEN_NAME: ${{ secrets.GITLAB_TOKEN_NAME }}
+        FIRMWARE_LINK: ${{ github.event.inputs.FIRMWARE_LINK }}
       run: |
         cd workspace/dumprx/out
-        rm -rf .git
-        rm -rf .gitignore
-        rm -rf .gitattributes
-        DUMP_DIR_LIST=$(find -type d -not -empty -printf "%P\n" | grep -v / | grep -v .git)
+        rm -rf .git .gitignore .gitattributes
+        DUMP_BRANCH=$(basename "${FIRMWARE_LINK%%\?*}")
+        DUMP_BRANCH="${DUMP_BRANCH%.zip}"
+        DUMP_BRANCH=$(printf '%s' "$DUMP_BRANCH" | sed 's/[^a-zA-Z0-9._/-]/-/g')
+        if [ -z "$DUMP_BRANCH" ] || ! git check-ref-format --branch "$DUMP_BRANCH" >/dev/null 2>&1; then
+          echo "ERROR: Invalid branch name extracted from firmware link: $DUMP_BRANCH"
+          exit 1
+        fi
+        DUMP_DIR_LIST=$(find . -type d -not -empty -printf "%P\n" | grep -v / | grep -v .git || true)
         git init
         git lfs install
-        find . \( -name "*sensetime*" -o -name "*.lic" \) | cut -d'/' -f'2-' >| .gitignore
-        git branch -M ${{ env.BRANCH }}
-        git config --global user.name "Carlo Dandan"
-        git config --global user.email "carlodandan.personal@proton.me"
-        git remote add origin https://${{ secrets.GITLAB_TOKEN_NAME }}:${{ secrets.GITLAB_TOKEN }}@gitlab.com/${{ env.USERNAME }}/android_dump_${{ env.MANUFACTURER_NAME }}_${{ env.VENDOR_NAME }}.git
+        find . \( -name "*sensetime*" -o -name "*.lic" \) | cut -d'/' -f'2-' > .gitignore
+        git branch -M "$DUMP_BRANCH"
+        git config --global user.name "Samarth"
+        git config --global user.email "smrth097@gmail.com"
+        git remote add origin "https://${GITLAB_TOKEN_NAME}:${GITLAB_TOKEN}@gitlab.com/${GITLAB_PROJECT_PATH}.git"
         find . -type f -size +100M -exec git lfs track {} \;
         if [ -f .gitattributes ]; then
-            git add .gitattributes
-            git commit -s -m "Setup Git LFS"
-            git push -u origin ${{ env.BRANCH }}
+          git add .gitattributes
+          git commit -s -m "Setup Git LFS"
+          git push -u origin "$DUMP_BRANCH"
         fi
-        for dir in ${DUMP_DIR_LIST}; do
-            git add ${dir}
-            git commit -s -m "dump: ${dir}: import dump for ${VENDOR_NAME}
-            Firmware: ${{ github.event.inputs.FIRMWARE_LINK }}"
-            git push -u origin ${{ env.BRANCH }}
+        for dir in $DUMP_DIR_LIST; do
+          git add "$dir"
+          if ! git diff --cached --quiet; then
+            git commit -s -m "dump: ${dir}: import dump for ${VENDOR_NAME}" -m "Firmware: ${FIRMWARE_LINK}"
+            git push -u origin "$DUMP_BRANCH"
+          fi
         done
-        git add .
-        git commit -s -m "dump: import remaining dump for ${VENDOR_NAME}
-        Firmware: ${{ github.event.inputs.FIRMWARE_LINK }}"
-        git push -u origin ${{ env.BRANCH }}
+        git add -A
+        if ! git diff --cached --quiet; then
+          git commit -s -m "dump: import remaining dump for ${VENDOR_NAME}" -m "Firmware: ${FIRMWARE_LINK}"
+          git push -u origin "$DUMP_BRANCH"
+        fi
+        echo "Repository: https://gitlab.com/${GITLAB_PROJECT_PATH}"
+        echo "Dump branch: ${DUMP_BRANCH}"
+
+    - name: Set New Default Branch
+      env:
+        GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        GITLAB_PROJECT_ID: ${{ env.GITLAB_PROJECT_ID }}
+        FIRMWARE_LINK: ${{ github.event.inputs.FIRMWARE_LINK }}
+      run: |
+        DUMP_BRANCH=$(basename "${FIRMWARE_LINK%%\?*}")
+        DUMP_BRANCH="${DUMP_BRANCH%.zip}"
+        DUMP_BRANCH=$(printf '%s' "$DUMP_BRANCH" | sed 's/[^a-zA-Z0-9._/-]/-/g')
+        RESPONSE=$(curl -sS --request PUT \
+          --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+          --data-urlencode "default_branch=${DUMP_BRANCH}" \
+          "https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}")
+        if echo "$RESPONSE" | jq -e --arg branch "$DUMP_BRANCH" '.default_branch == $branch' >/dev/null; then
+          echo "Default branch updated to: ${DUMP_BRANCH}"
+        else
+          echo "ERROR: Could not update the default branch."
+          echo "$RESPONSE"
+          exit 1
+        fi
